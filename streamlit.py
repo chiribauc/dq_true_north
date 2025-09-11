@@ -52,19 +52,26 @@ def filter_df_by_brand(df: pd.DataFrame, brand_data_value: str) -> pd.DataFrame:
 
     # --- EXISTING LOGIC FOR BRAND-SPECIFIC FILTERING ---
     name_filter = df['RULE_NAME'].str.contains(brand_data_value, case=False, na=False)
+    
+    # Special handling for Historical Completeness rules - they should show for WSJ brand
+    historical_completeness_filter = pd.Series([False] * len(df), index=df.index)
+    if 'RULE_TYPE' in df.columns and brand_data_value == "WSJ":
+        # Show Historical Completeness rules for WSJ since they monitor WSJ data
+        historical_completeness_filter = (df['RULE_TYPE'] == 'HISTORICAL_COMPLETENESS')
+    
     global_summary_filter = pd.Series([False] * len(df), index=df.index)
     if 'RULE_TYPE' in df.columns:
-        # Show UNIQUENESS rules - try multiple approaches to find them
+        # Show UNIQUENESS and HISTORICAL_COMPLETENESS rules - try multiple approaches to find them
         if brand_data_value == "__GLOBAL__":
-            # For global view, show all UNIQUENESS rules
-            global_summary_filter = (df['RULE_TYPE'] == 'UNIQUENESS')
+            # For global view, show all UNIQUENESS and HISTORICAL_COMPLETENESS rules
+            global_summary_filter = (df['RULE_TYPE'].isin(['UNIQUENESS', 'HISTORICAL_COMPLETENESS']))
         else:
-            # For brand-specific view, show UNIQUENESS rules that might be related to this brand
-            uniqueness_rules = (df['RULE_TYPE'] == 'UNIQUENESS')
-            # Try different ways to match brand: rule name contains brand, or show all UNIQUENESS rules
+            # For brand-specific view, show rules that might be related to this brand
+            relevant_rule_types = (df['RULE_TYPE'].isin(['UNIQUENESS', 'HISTORICAL_COMPLETENESS']))
+            # Try different ways to match brand: rule name contains brand, or show all relevant rules
             brand_in_name = df['RULE_NAME'].str.contains(brand_data_value, case=False, na=False)
-            # For now, show ALL uniqueness rules on brand pages to debug
-            global_summary_filter = uniqueness_rules
+            # For now, show ALL relevant rules on brand pages to debug
+            global_summary_filter = relevant_rule_types
 
     json_filter = pd.Series([False] * len(df), index=df.index)
     if json_col_name:
@@ -82,12 +89,13 @@ def filter_df_by_brand(df: pd.DataFrame, brand_data_value: str) -> pd.DataFrame:
                 return False
         json_filter = df[json_col_name].apply(check_brand_in_json)
 
-    final_filter = global_summary_filter | name_filter | json_filter
+    final_filter = name_filter | json_filter | historical_completeness_filter
     return df[final_filter].copy()
 
 # --- AI Helper Functions (MODIFIED FOR CONTEXTUAL ANALYSIS) ---
 RULE_DEFINITIONS = """
 - **Uniqueness / Duplicate Check**: Verifies that records are unique. This can be a simple SQL-based check for duplicates on a given day or a more advanced check that finds records where multiple columns are identical, with special handling for case-insensitivity ('WSJ' = 'wsj') and numeric rounding.
+- **Historical Completeness**: Monitors record count consistency over 60-day rolling windows by calculating expected changes (removing the 61st day count and adding the newest day count) and comparing against actual cumulative counts. Flags discrepancies outside tolerance thresholds.
 - **Sustained Trend**: Monitors a metric for consecutive increases over time.
 - **Anomaly Detection**: Uses machine learning to find unexpected spikes or drops.
 - **Completeness Check**: Validates that yesterday's data is present.
@@ -111,26 +119,124 @@ def call_cortex_llm(prompt: str) -> str:
     except Exception as e:
         return f"Error calling Cortex LLM: {e}"
 
-def generate_ai_summary_for_tab(data_df: pd.DataFrame, analysis_type: str, brand_name: str, relevant_cols: list):
-    """Creates a contextual AI summary section for a given DataFrame."""
+def generate_ai_insights_for_tab(data_df: pd.DataFrame, analysis_type: str, brand_name: str, relevant_cols: list, full_data_df: pd.DataFrame = None):
+    """Creates enhanced AI insights for any data scenario - success, failure, or mixed results."""
     st.divider()
-    st.subheader("Tab-Specific AI Analysis")
-    if st.button(f"Generate AI Summary for these {analysis_type.lower()}", key=f"ai_{analysis_type.replace(' ', '_')}"):
-        with st.spinner(f"AI is analyzing the {analysis_type.lower()}..."):
-            if data_df is not None and not data_df.empty:
-                data_for_prompt = data_df[relevant_cols].to_json(orient='records', date_format='iso')
-                summary_prompt = get_summary_prompt(data_for_prompt, brand_name, analysis_type)
-                summary = call_cortex_llm(summary_prompt)
-                st.markdown(summary)
-            else:
-                st.success(f"No {analysis_type.lower()} were found to analyze for {brand_name}.")
+    st.subheader("AI-Powered Analysis")
+    
+    # Create contextual button text
+    button_text = f"Get AI Insights on {analysis_type}"
+    button_key = f"ai_insights_{analysis_type.replace(' ', '_').replace('/', '_')}"
+    
+    if st.button(button_text, key=button_key):
+        with st.spinner(f"AI is analyzing {analysis_type.lower()} data..."):
+            # Determine the data scenario
+            has_data = data_df is not None and not data_df.empty
+            has_full_data = full_data_df is not None and not full_data_df.empty
+            
+            if has_data or has_full_data:
+                # Use appropriate dataset for analysis
+                analysis_data = data_df if has_data else full_data_df
+                
+                # Determine data quality status
+                if 'STATUS' in analysis_data.columns:
+                    pass_count = len(analysis_data[analysis_data['STATUS'] == 'PASS'])
+                    fail_count = len(analysis_data[analysis_data['STATUS'] == 'FAIL'])
+                    error_count = len(analysis_data[analysis_data['STATUS'] == 'ERROR'])
+                    total_count = len(analysis_data)
+                elif 'INDICATOR' in analysis_data.columns:
+                    pass_count = len(analysis_data[analysis_data['INDICATOR'] == 'PASS'])
+                    fail_count = len(analysis_data[analysis_data['INDICATOR'] == 'FAIL'])
+                    error_count = len(analysis_data[analysis_data['INDICATOR'] == 'ERROR'])
+                    total_count = len(analysis_data)
+                else:
+                    # For data without explicit status, assume issues if data exists
+                    fail_count = len(analysis_data)
+                    pass_count = 0
+                    error_count = 0
+                    total_count = len(analysis_data)
+                
+                # Create enhanced prompt based on scenario
+                if fail_count == 0 and error_count == 0:
+                    # Success scenario
+                    scenario = "SUCCESS"
+                    scenario_description = f"All {total_count} {analysis_type.lower()} checks are passing"
+                elif fail_count > 0 and pass_count > 0:
+                    # Mixed scenario
+                    scenario = "MIXED"
+                    scenario_description = f"Mixed results: {pass_count} passing, {fail_count} failing"
+                else:
+                    # Failure scenario
+                    scenario = "FAILURE"
+                    scenario_description = f"Issues detected: {fail_count} failures, {error_count} errors"
+                
+                # Prepare data for analysis
+                analysis_cols = [col for col in relevant_cols if col in analysis_data.columns]
+                data_for_prompt = analysis_data[analysis_cols].to_json(orient='records', date_format='iso')
+                
+                # Create enhanced prompt
+                enhanced_prompt = f"""You are a data quality analyst for '{brand_name}'. 
+                
+ANALYSIS CONTEXT:
+- Rule Type: {analysis_type}
+- Data Scenario: {scenario_description}
+- Total Records Analyzed: {total_count}
 
-def generate_ai_summary_for_duplicates(data_df: pd.DataFrame, brand_name: str):
-    """Creates an optimized AI summary section specifically for duplicate records."""
+INSTRUCTIONS:
+Based on the {scenario.lower()} scenario, provide insights that include:
+
+1. **Overall Assessment**: What does this data tell us about {analysis_type.lower()} for {brand_name}?
+
+2. **Key Findings**: Highlight the most important patterns, trends, or issues.
+
+3. **Business Impact**: What are the implications for data quality and business operations?
+
+4. **Recommendations**: 
+   - If everything is good: How to maintain this quality level
+   - If there are issues: Immediate actions and investigation steps
+   - If mixed results: Prioritization and focus areas
+
+5. **Monitoring Strategy**: What should be watched going forward?
+
+DATA TO ANALYZE:
+{data_for_prompt}
+
+Be concise but comprehensive. Focus on actionable insights."""
+
+                summary = call_cortex_llm(enhanced_prompt)
+                st.markdown(summary)
+                
+                # Add summary metrics
+                if total_count > 0:
+                    st.info(f"📊 **Analysis Summary**: {scenario_description} out of {total_count} total records")
+                
+            else:
+                # No data scenario - still provide value
+                no_data_prompt = f"""You are a data quality analyst for '{brand_name}'. 
+                
+There is currently no {analysis_type.lower()} data to analyze, which could mean:
+1. All systems are operating perfectly (ideal scenario)
+2. No rules have been executed yet
+3. Data collection issues
+
+Provide insights on:
+1. What this lack of data typically indicates for {analysis_type.lower()}
+2. Best practices for monitoring {analysis_type.lower()}
+3. Recommended proactive measures for {brand_name}
+4. What to watch for when data becomes available
+
+Be encouraging but informative about maintaining data quality standards."""
+                
+                summary = call_cortex_llm(no_data_prompt)
+                st.success(f"✅ No {analysis_type.lower()} issues detected for {brand_name}")
+                st.markdown(summary)
+
+def generate_ai_insights_for_duplicates(data_df: pd.DataFrame, brand_name: str):
+    """Creates enhanced AI insights specifically for duplicate records with universal functionality."""
     st.divider()
-    st.subheader("Tab-Specific AI Analysis")
-    if st.button("Generate AI Summary for these duplicate records", key="ai_duplicate_records"):
-        with st.spinner("AI is analyzing the duplicate records..."):
+    st.subheader("AI-Powered Analysis")
+    if st.button("Get AI Insights on Duplicate Records", key="ai_insights_duplicate_records"):
+        with st.spinner("AI is analyzing duplicate records data..."):
             if data_df is not None and not data_df.empty:
                 total_records = len(data_df)
                 
@@ -149,61 +255,208 @@ def generate_ai_summary_for_duplicates(data_df: pd.DataFrame, brand_name: str):
                         if date_columns:
                             unique_dates = data_df[date_columns[0]].nunique()
                         
-                        # Create summary data for the prompt
-                        summary_data = {
-                            "total_duplicate_entries": total_records,
-                            "total_affected_records": int(total_duplicate_count),
-                            "average_duplicates_per_entry": round(avg_duplicates, 2),
-                            "maximum_duplicates_for_single_entry": int(max_duplicates),
-                            "minimum_duplicates_for_single_entry": int(min_duplicates),
-                            "unique_dates_affected": unique_dates if unique_dates else "Not available"
-                        }
+                        enhanced_prompt = f"""You are a data quality analyst for '{brand_name}'. 
                         
-                        summary_prompt = f"""You are a data quality analyst. Analyze the following duplicate records summary for the publication '{brand_name}'. 
-                        
-                        IMPORTANT: This is a summary of {total_records} duplicate record entries (too many to analyze individually).
-                        
-                        Summary Statistics:
-                        - Total duplicate entries found: {summary_data['total_duplicate_entries']}
-                        - Total affected records: {summary_data['total_affected_records']}
-                        - Average duplicates per entry: {summary_data['average_duplicates_per_entry']}
-                        - Maximum duplicates for a single entry: {summary_data['maximum_duplicates_for_single_entry']}
-                        - Minimum duplicates for a single entry: {summary_data['minimum_duplicates_for_single_entry']}
-                        - Unique dates affected: {summary_data['unique_dates_affected']}
-                        
-                        Please provide insights on:
-                        1. The scale and severity of the duplication issue
-                        2. What these numbers indicate about data quality
-                        3. Potential business impact
-                        4. Recommended next steps for investigation
-                        
-                        Be concise and focus on actionable insights."""
+DUPLICATE RECORDS ANALYSIS:
+- Total duplicate entries found: {total_records}
+- Total affected records: {int(total_duplicate_count)}
+- Average duplicates per entry: {round(avg_duplicates, 2)}
+- Maximum duplicates for single entry: {int(max_duplicates)}
+- Minimum duplicates for single entry: {int(min_duplicates)}
+- Unique dates affected: {unique_dates if unique_dates else "Not available"}
+
+ANALYSIS SCOPE: Large dataset ({total_records} entries) - providing statistical summary.
+
+Provide comprehensive insights on:
+1. **Scale Assessment**: How significant is this duplication issue for {brand_name}?
+2. **Data Quality Impact**: What do these patterns indicate about data collection processes?
+3. **Business Risk**: Potential operational and financial implications
+4. **Root Cause Analysis**: Likely sources of these duplications
+5. **Immediate Actions**: Prioritized steps for investigation and resolution
+6. **Prevention Strategy**: Long-term measures to prevent future duplications
+7. **Monitoring Recommendations**: Ongoing quality checks to implement
+
+Focus on actionable business insights and practical next steps."""
                         
                     except Exception as e:
-                        summary_prompt = f"""You are a data quality analyst. There are {total_records} duplicate record entries for '{brand_name}'. 
-                        This is a large dataset that requires immediate attention. Please provide insights on:
-                        1. The significance of having {total_records} duplicate entries
-                        2. Potential business impact of this scale of duplication
-                        3. Recommended immediate actions"""
+                        enhanced_prompt = f"""You are a data quality analyst for '{brand_name}'. 
+                        
+There are {total_records} duplicate record entries requiring immediate attention.
+                        
+Provide insights on:
+1. The business significance of having {total_records} duplicate entries
+2. Potential operational and financial impact 
+3. Immediate investigation and remediation actions
+4. Prevention strategies for future occurrences
+5. Monitoring recommendations
+                        
+Focus on actionable guidance for this scale of duplication issue."""
                 else:
-                    # For smaller datasets, analyze individual records as before
+                    # For smaller datasets, analyze individual records
                     relevant_cols = ['DUPLICATE_VALUES', 'DUPLICATE_COUNT'] if 'DUPLICATE_COUNT' in data_df.columns else list(data_df.columns)
-                    # Only include columns that exist in the dataframe
                     relevant_cols = [col for col in relevant_cols if col in data_df.columns]
                     data_for_prompt = data_df[relevant_cols].to_json(orient='records', date_format='iso')
-                    summary_prompt = get_summary_prompt(data_for_prompt, brand_name, "Duplicate Records")
-                
-                summary = call_cortex_llm(summary_prompt)
-                st.markdown(summary)
-            else:
-                st.success(f"No duplicate records were found to analyze for {brand_name}.")
+                    
+                    enhanced_prompt = f"""You are a data quality analyst for '{brand_name}'.
+                    
+DUPLICATE RECORDS ANALYSIS:
+- Dataset Size: {total_records} duplicate entries (detailed analysis)
 
-def generate_ai_summary_for_spike_dip(data_df: pd.DataFrame, brand_name: str):
-    """Creates an optimized AI summary section specifically for spike and dip events."""
+Analyze the following duplicate records data and provide insights on:
+1. **Pattern Analysis**: What patterns do you see in the duplications?
+2. **Severity Assessment**: How critical are these duplications?
+3. **Business Impact**: Effects on data reliability and operations
+4. **Investigation Steps**: Specific actions to understand root causes
+5. **Resolution Strategy**: Step-by-step remediation approach
+6. **Prevention Measures**: How to avoid future duplications
+
+Data to analyze:
+{data_for_prompt}
+
+Provide practical, actionable insights focused on data quality improvement."""
+                
+                summary = call_cortex_llm(enhanced_prompt)
+                st.markdown(summary)
+                st.info(f"📊 **Analysis Summary**: Found {total_records} duplicate record entries affecting data quality")
+            else:
+                # No duplicates found - success scenario
+                success_prompt = f"""You are a data quality analyst for '{brand_name}'.
+                
+DUPLICATE RECORDS STATUS: No duplicate records detected - excellent data quality!
+
+Provide insights on:
+1. **Quality Achievement**: What this clean state indicates about {brand_name}'s data processes
+2. **Maintenance Strategy**: How to sustain this high data quality standard
+3. **Proactive Monitoring**: Best practices for ongoing duplicate prevention
+4. **System Health**: What this suggests about data collection and validation processes
+5. **Future Vigilance**: Key indicators to monitor for potential duplication issues
+
+Focus on maintaining and building upon this excellent data quality foundation."""
+                
+                summary = call_cortex_llm(success_prompt)
+                st.success(f"✅ No duplicate records detected for {brand_name} - excellent data quality!")
+                st.markdown(summary)
+
+def generate_ai_insights_for_sustained_trends(data_df: pd.DataFrame, brand_name: str):
+    """Creates enhanced AI insights specifically for sustained trend events with universal functionality."""
     st.divider()
-    st.subheader("Tab-Specific AI Analysis")
-    if st.button("Generate AI Summary for these spike and dip events", key="ai_spike_dip_events"):
-        with st.spinner("AI is analyzing the spike and dip events..."):
+    st.subheader("AI-Powered Analysis")
+    if st.button("Get AI Insights on Sustained Trends", key="ai_insights_sustained_trends"):
+        with st.spinner("AI is analyzing sustained trend data..."):
+            if data_df is not None and not data_df.empty:
+                total_trends = len(data_df)
+                
+                if total_trends > 100:
+                    # For large datasets, provide summary statistics instead of individual trends
+                    try:
+                        # Calculate summary statistics
+                        if 'TREND_LENGTH' in data_df.columns:
+                            avg_trend_length = data_df['TREND_LENGTH'].mean()
+                            max_trend_length = data_df['TREND_LENGTH'].max()
+                            min_trend_length = data_df['TREND_LENGTH'].min()
+                            total_trend_days = data_df['TREND_LENGTH'].sum()
+                        else:
+                            avg_trend_length = max_trend_length = min_trend_length = total_trend_days = "Not available"
+                        
+                        # Get unique dates and segments
+                        unique_dates = "Not available"
+                        date_columns = [col for col in data_df.columns if 'DATE' in col.upper()]
+                        if date_columns:
+                            unique_dates = data_df[date_columns[0]].nunique()
+                        
+                        unique_segments = "Not available"
+                        if 'SEGMENT_VALUES' in data_df.columns:
+                            unique_segments = data_df['SEGMENT_VALUES'].nunique()
+                        
+                        enhanced_prompt = f"""You are a data quality analyst for '{brand_name}'.
+                        
+SUSTAINED TREND ANALYSIS:
+- Total sustained trends detected: {total_trends}
+- Average trend length: {round(avg_trend_length, 1) if isinstance(avg_trend_length, (int, float)) else avg_trend_length} days
+- Longest trend: {int(max_trend_length) if isinstance(max_trend_length, (int, float)) else max_trend_length} days
+- Shortest trend: {int(min_trend_length) if isinstance(min_trend_length, (int, float)) else min_trend_length} days
+- Total trend days: {int(total_trend_days) if isinstance(total_trend_days, (int, float)) else total_trend_days} days
+- Unique dates affected: {unique_dates}
+- Unique segments affected: {unique_segments}
+
+ANALYSIS SCOPE: Large dataset ({total_trends} trends) - providing statistical summary.
+
+Provide comprehensive insights on:
+1. **Trend Significance**: What does detecting {total_trends} sustained trends indicate for {brand_name}?
+2. **Pattern Analysis**: What do these trend lengths and frequencies suggest about business dynamics?
+3. **Business Impact**: Operational implications of sustained growth or decline patterns
+4. **Market Indicators**: What sustained trends typically signal in order volume data
+5. **Risk Assessment**: Potential concerns with prolonged directional movements
+6. **Strategic Insights**: How to leverage positive trends and address negative ones
+7. **Monitoring Strategy**: Recommended actions for ongoing trend surveillance
+
+Focus on actionable business insights for trend management and strategic planning."""
+                        
+                    except Exception as e:
+                        enhanced_prompt = f"""You are a data quality analyst for '{brand_name}'.
+                        
+There are {total_trends} sustained trend events indicating significant directional patterns in order data.
+                        
+Provide insights on:
+1. The business significance of {total_trends} sustained trend events
+2. Potential operational impact of sustained directional movements
+3. Immediate analysis and strategic response actions
+4. Long-term trend monitoring recommendations
+                        
+Focus on actionable guidance for trend-based decision making."""
+                else:
+                    # For smaller datasets, analyze individual trends
+                    relevant_cols = ['SEGMENT_VALUES', 'TREND_LENGTH', 'TREND_START_DATE', 'TREND_END_DATE']
+                    relevant_cols = [col for col in relevant_cols if col in data_df.columns]
+                    data_for_prompt = data_df[relevant_cols].to_json(orient='records', date_format='iso')
+                    
+                    enhanced_prompt = f"""You are a data quality analyst for '{brand_name}'.
+                    
+SUSTAINED TREND ANALYSIS:
+- Dataset Size: {total_trends} sustained trends (detailed analysis)
+
+Analyze the following sustained trend data and provide insights on:
+1. **Trend Patterns**: What specific patterns emerge from these sustained movements?
+2. **Duration Analysis**: How concerning or promising are these trend lengths?
+3. **Business Impact**: Effects on order volume stability and growth
+4. **Segment Analysis**: Which segments show the most significant trends?
+5. **Strategic Response**: Specific actions for positive vs negative trends
+6. **Monitoring Recommendations**: How to track and respond to future trends
+
+Data to analyze:
+{data_for_prompt}
+
+Provide practical insights for trend-based business strategy and operations."""
+                
+                summary = call_cortex_llm(enhanced_prompt)
+                st.markdown(summary)
+                st.info(f"📊 **Analysis Summary**: Detected {total_trends} sustained trend events requiring strategic attention")
+            else:
+                # No sustained trends - success scenario
+                success_prompt = f"""You are a data quality analyst for '{brand_name}'.
+                
+SUSTAINED TREND STATUS: No sustained trends detected - balanced order patterns!
+
+Provide insights on:
+1. **Pattern Stability**: What this balanced state indicates about {brand_name}'s market performance
+2. **Market Position**: Benefits of stable, non-trending order patterns
+3. **Operational Advantages**: How balanced patterns support business operations
+4. **Growth Opportunities**: Strategies to generate positive sustained trends
+5. **Monitoring Strategy**: Best practices to detect early trend formations
+6. **Competitive Analysis**: What stable patterns suggest about market positioning
+
+Focus on leveraging stability while preparing for strategic growth initiatives."""
+                
+                summary = call_cortex_llm(success_prompt)
+                st.success(f"✅ No sustained trends detected for {brand_name} - balanced order patterns!")
+                st.markdown(summary)
+
+def generate_ai_insights_for_spike_dip(data_df: pd.DataFrame, brand_name: str):
+    """Creates enhanced AI insights specifically for spike and dip events with universal functionality."""
+    st.divider()
+    st.subheader("AI-Powered Analysis")
+    if st.button("Get AI Insights on Spike and Dip Events", key="ai_insights_spike_dip_events"):
+        with st.spinner("AI is analyzing spike and dip events data..."):
             if data_df is not None and not data_df.empty:
                 total_events = len(data_df)
                 
@@ -222,72 +475,100 @@ def generate_ai_summary_for_spike_dip(data_df: pd.DataFrame, brand_name: str):
                         else:
                             avg_change = max_spike = max_dip = std_change = "Not available"
                         
-                        # Get unique dates if available
+                        # Get unique dates and segments
                         unique_dates = "Not available"
                         date_columns = [col for col in data_df.columns if 'DATE' in col.upper()]
                         if date_columns:
                             unique_dates = data_df[date_columns[0]].nunique()
                         
-                        # Get unique segments if available
                         unique_segments = "Not available"
                         if 'SEGMENT_VALUES' in data_df.columns:
                             unique_segments = data_df['SEGMENT_VALUES'].nunique()
                         
-                        # Create summary data for the prompt
-                        summary_data = {
-                            "total_events": total_events,
-                            "spike_count": spike_count,
-                            "dip_count": dip_count,
-                            "average_percent_change": round(avg_change, 2) if isinstance(avg_change, (int, float)) else avg_change,
-                            "maximum_spike_percent": round(max_spike, 2) if isinstance(max_spike, (int, float)) else max_spike,
-                            "maximum_dip_percent": round(max_dip, 2) if isinstance(max_dip, (int, float)) else max_dip,
-                            "change_volatility": round(std_change, 2) if isinstance(std_change, (int, float)) else std_change,
-                            "unique_dates_affected": unique_dates,
-                            "unique_segments_affected": unique_segments
-                        }
+                        enhanced_prompt = f"""You are a data quality analyst for '{brand_name}'.
                         
-                        summary_prompt = f"""You are a data quality analyst. Analyze the following spike and dip events summary for the publication '{brand_name}'. 
-                        
-                        IMPORTANT: This is a summary of {total_events} spike and dip events (too many to analyze individually).
-                        
-                        Summary Statistics:
-                        - Total spike/dip events: {summary_data['total_events']}
-                        - Number of spikes (positive changes): {summary_data['spike_count']}
-                        - Number of dips (negative changes): {summary_data['dip_count']}
-                        - Average percent change: {summary_data['average_percent_change']}%
-                        - Maximum spike: {summary_data['maximum_spike_percent']}%
-                        - Maximum dip: {summary_data['maximum_dip_percent']}%
-                        - Change volatility (std dev): {summary_data['change_volatility']}%
-                        - Unique dates affected: {summary_data['unique_dates_affected']}
-                        - Unique segments affected: {summary_data['unique_segments_affected']}
-                        
-                        Please provide insights on:
-                        1. The frequency and severity of order volume fluctuations
-                        2. Whether the data shows more spikes or dips and what this indicates
-                        3. The volatility level and its business implications
-                        4. Potential operational or market factors that could cause these patterns
-                        5. Recommended monitoring and response strategies
-                        
-                        Be concise and focus on actionable business insights."""
+SPIKE AND DIP EVENTS ANALYSIS:
+- Total volatility events: {total_events}
+- Spikes (positive changes): {spike_count}
+- Dips (negative changes): {dip_count}
+- Average percent change: {round(avg_change, 2) if isinstance(avg_change, (int, float)) else avg_change}%
+- Maximum spike: {round(max_spike, 2) if isinstance(max_spike, (int, float)) else max_spike}%
+- Maximum dip: {round(max_dip, 2) if isinstance(max_dip, (int, float)) else max_dip}%
+- Volatility level (std dev): {round(std_change, 2) if isinstance(std_change, (int, float)) else std_change}%
+- Unique dates affected: {unique_dates}
+- Unique segments affected: {unique_segments}
+
+ANALYSIS SCOPE: Large dataset ({total_events} events) - providing statistical summary.
+
+Provide comprehensive insights on:
+1. **Volatility Assessment**: What does this level of order fluctuation indicate for {brand_name}?
+2. **Pattern Analysis**: Balance between spikes vs dips and what this suggests
+3. **Business Impact**: Operational implications of this volatility level
+4. **Market Factors**: Potential external drivers of these patterns
+5. **Risk Evaluation**: Critical thresholds and concerning trends
+6. **Operational Response**: Recommended monitoring and response strategies
+7. **Stability Measures**: Actions to reduce harmful volatility
+
+Focus on actionable business insights for order volume management."""
                         
                     except Exception as e:
-                        summary_prompt = f"""You are a data quality analyst. There are {total_events} spike and dip events for '{brand_name}'. 
-                        This indicates significant volatility in order patterns that requires immediate attention. Please provide insights on:
-                        1. The significance of having {total_events} volatility events
-                        2. Potential business impact of this level of order fluctuation
-                        3. Recommended immediate analysis and monitoring actions"""
+                        enhanced_prompt = f"""You are a data quality analyst for '{brand_name}'.
+                        
+There are {total_events} spike and dip events indicating significant order volatility.
+                        
+Provide insights on:
+1. The business significance of {total_events} volatility events
+2. Potential operational impact of this order fluctuation level
+3. Immediate analysis and monitoring actions needed
+4. Stability improvement recommendations
+                        
+Focus on actionable guidance for managing order volatility."""
                 else:
-                    # For smaller datasets, analyze individual events as before
+                    # For smaller datasets, analyze individual events
                     relevant_cols = ['EVENT_DATE', 'METRIC_VALUE', 'PREVIOUS_METRIC_VALUE', 'PERCENT_CHANGE']
-                    # Only include columns that exist in the dataframe
                     relevant_cols = [col for col in relevant_cols if col in data_df.columns]
                     data_for_prompt = data_df[relevant_cols].to_json(orient='records', date_format='iso')
-                    summary_prompt = get_summary_prompt(data_for_prompt, brand_name, "Spike and Dip Events")
+                    
+                    enhanced_prompt = f"""You are a data quality analyst for '{brand_name}'.
+                    
+SPIKE AND DIP EVENTS ANALYSIS:
+- Dataset Size: {total_events} volatility events (detailed analysis)
+
+Analyze the following spike and dip data and provide insights on:
+1. **Event Patterns**: What specific patterns emerge from these volatility events?
+2. **Severity Assessment**: How concerning are these fluctuations?
+3. **Business Impact**: Effects on order processing and operations
+4. **Trend Analysis**: Direction and frequency of volatility
+5. **Response Strategy**: Specific actions for each type of event
+6. **Prevention Measures**: Ways to stabilize order volumes
+
+Data to analyze:
+{data_for_prompt}
+
+Provide practical insights for order volume stability and business continuity."""
                 
-                summary = call_cortex_llm(summary_prompt)
+                summary = call_cortex_llm(enhanced_prompt)
                 st.markdown(summary)
+                st.info(f"📊 **Analysis Summary**: Detected {total_events} order volatility events requiring monitoring")
             else:
-                st.success(f"No spike and dip events were found to analyze for {brand_name}.")
+                # No volatility events - success scenario
+                success_prompt = f"""You are a data quality analyst for '{brand_name}'.
+                
+SPIKE AND DIP STATUS: No significant order volatility detected - excellent stability!
+
+Provide insights on:
+1. **Stability Achievement**: What this consistent order pattern indicates about {brand_name}'s market position
+2. **Operational Excellence**: How stable orders benefit business operations
+3. **Monitoring Strategy**: Best practices to maintain this order stability
+4. **Early Warning Systems**: Key indicators to watch for potential volatility
+5. **Growth Opportunities**: How stability enables strategic planning
+6. **Competitive Advantage**: What consistent performance means in the market
+
+Focus on leveraging and maintaining this excellent order stability."""
+                
+                summary = call_cortex_llm(success_prompt)
+                st.success(f"✅ No significant order volatility detected for {brand_name} - excellent stability!")
+                st.markdown(summary)
 
 # --- 3. Sidebar Navigation ---
 with st.sidebar:
@@ -321,10 +602,11 @@ st.header(f"{display_brand} - {selected_metric}")
 
 # --- 5. Main Dashboard Tabs ---
 # *** Updated to reflect all rule types from the library ***
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "Summary", 
-    "Same Date Uniqueness Details", 
+    "Uniqueness / Duplicate Details", 
     "Completeness Details",
+    "Historical Completeness Details",
     "Sustained Trend Details", 
     "Missing Data Details", 
     "Spike / Dip Details", 
@@ -342,11 +624,15 @@ with tab1:
                 indicator_options = ["PASS", "FAIL", "ERROR"]
                 selected_indicators = st.multiselect("Filter by Status:", options=indicator_options, default=indicator_options, key="summary_status_filter")
             with filter_cols[1]:
+                # Get RULE_TYPE values from the actual data (not RULE_NAME)
                 all_rule_types = all_summary_df['RULE_TYPE'].unique().tolist()
+                # Filter out system-level rule types that aren't actual data quality rules
+                business_rule_types = sorted([rt for rt in all_rule_types if rt not in ['SYSTEM', 'SYSTEM_ERROR']])
+                
                 all_option = "All Rule Types"
-                rule_type_options = [all_option] + all_rule_types
+                rule_type_options = [all_option] + business_rule_types
                 user_selected_types = st.multiselect("Filter by Rule Type:", options=rule_type_options, default=[all_option], key="summary_type_filter")
-                selected_rule_types = all_rule_types if all_option in user_selected_types else user_selected_types
+                selected_rule_types = business_rule_types if all_option in user_selected_types else user_selected_types
 
             brand_summary_df = filter_df_by_brand(all_summary_df, data_brand)
             filtered_summary_df = brand_summary_df[
@@ -361,18 +647,25 @@ with tab1:
                 error_count = len(filtered_summary_df[filtered_summary_df['INDICATOR'] == 'ERROR'])
                 pass_rate = (total_runs - fail_count - error_count) / total_runs * 100 if total_runs > 0 else 100
                 
-                # Add UNIQUENESS rule metrics
+                # Add UNIQUENESS and HISTORICAL_COMPLETENESS rule metrics
                 uniqueness_count = len(filtered_summary_df[filtered_summary_df['RULE_TYPE'] == 'UNIQUENESS'])
                 uniqueness_failures = len(filtered_summary_df[
                     (filtered_summary_df['RULE_TYPE'] == 'UNIQUENESS') & 
                     (filtered_summary_df['INDICATOR'] == 'FAIL')
                 ])
                 
-                metric_cols = st.columns(4)
+                hist_completeness_count = len(filtered_summary_df[filtered_summary_df['RULE_TYPE'] == 'HISTORICAL_COMPLETENESS'])
+                hist_completeness_failures = len(filtered_summary_df[
+                    (filtered_summary_df['RULE_TYPE'] == 'HISTORICAL_COMPLETENESS') & 
+                    (filtered_summary_df['INDICATOR'] == 'FAIL')
+                ])
+                
+                metric_cols = st.columns(5)
                 metric_cols[0].metric("Total Rules Executed", f"{total_runs}")
                 metric_cols[1].metric("Pass Rate", f"{pass_rate:.2f}%")
                 metric_cols[2].metric("Total Failures/Errors", f"{fail_count + error_count}", delta=f"{fail_count + error_count} issues", delta_color="inverse")
                 metric_cols[3].metric("UNIQUENESS Rules", f"{uniqueness_count}", help=f"Failed: {uniqueness_failures}")
+                metric_cols[4].metric("HISTORICAL_COMPLETENESS Rules", f"{hist_completeness_count}", help=f"Failed: {hist_completeness_failures}")
                 
                 # Debug information
                 if st.checkbox("Show Debug Info", key="debug_summary"):
@@ -414,18 +707,19 @@ with tab1:
                         st.write("**All available rules in system:**")
                         st.dataframe(all_summary_df[['RULE_NAME', 'RULE_TYPE', 'INDICATOR', 'SEGMENT_VALUE']].head(10))
                 
-            generate_ai_summary_for_tab(
+            generate_ai_insights_for_tab(
                 data_df=filtered_summary_df[filtered_summary_df['INDICATOR'] == 'FAIL'],
-                analysis_type="Overall Failures",
+                analysis_type="Overall Quality Results",
                 brand_name=display_brand,
-                relevant_cols=['RULE_NAME', 'RULE_TYPE', 'RESULT_VALUE']
+                relevant_cols=['RULE_NAME', 'RULE_TYPE', 'RESULT_VALUE'],
+                full_data_df=filtered_summary_df
             )
         except Exception as e:
             st.error(f"Could not load summary data: {e}")
 
-# --- TAB 2: Same Date Uniqueness Details ---
+# --- TAB 2: Uniqueness / Duplicate Details ---
 with tab2:
-    st.header("Same Date Uniqueness Details") 
+    st.header("Uniqueness / Duplicate Details") 
     dup_details_pd_df = pd.DataFrame()
     with st.spinner("Loading duplicate record details..."):
         try:
@@ -465,8 +759,8 @@ with tab2:
             except Exception as table_err:
                 st.error(f"Could not show tables: {table_err}")
             
-    # *** Updated to use optimized AI summary for duplicate records ***
-    generate_ai_summary_for_duplicates(
+    # *** Updated to use enhanced AI insights for duplicate records ***
+    generate_ai_insights_for_duplicates(
         data_df=dup_details_pd_df,
         brand_name=display_brand
     )
@@ -486,15 +780,198 @@ with tab3:
         except Exception as e:
             st.error(f"Could not load data from DQ_DETAILS_COMPLETENESS: {e}")
 
-    generate_ai_summary_for_tab(
+    generate_ai_insights_for_tab(
         data_df=completeness_pd_df,
-        analysis_type="Completeness Failures",
+        analysis_type="Completeness Check Results",
         brand_name=display_brand,
         relevant_cols=['EXPECTED_DATE', 'ACTUAL_MAX_DATE', 'DAYS_MISSING']
     )
 
-# --- TAB 4: Sustained Trend Details ---
+# --- TAB 4: Historical Completeness Details ---
 with tab4:
+    st.header("Historical Completeness Details")
+    st.markdown("This section shows historical completeness checks that monitor record count consistency over 60-day rolling windows.")
+    
+    historical_completeness_pd_df = pd.DataFrame()
+    with st.spinner("Loading historical completeness details..."):
+        try:
+            # First check if we have any HISTORICAL_COMPLETENESS rules for this brand in the summary
+            all_summary_df = session.table("DQ_RESULTS").to_pandas()
+            brand_summary_df = filter_df_by_brand(all_summary_df, data_brand)
+            hist_completeness_rules = brand_summary_df[brand_summary_df['RULE_TYPE'] == 'HISTORICAL_COMPLETENESS']
+            
+            st.subheader("Historical Completeness Rules Summary")
+            if not hist_completeness_rules.empty:
+                st.write(f"Found {len(hist_completeness_rules)} Historical Completeness rule(s) for {display_brand}:")
+                st.dataframe(hist_completeness_rules[['RULE_NAME', 'RULE_TYPE', 'INDICATOR', 'RESULT_VALUE', 'EXECUTION_TIMESTAMP']])
+            else:
+                st.info(f"No Historical Completeness rules found for {display_brand} in the DQ_RESULTS table.")
+            
+            st.divider()
+            st.subheader("Detailed Historical Completeness Results")
+            
+            # Load the detailed historical completeness records
+            try:
+                all_hist_completeness_details = session.table("DQ_HISTORICAL_COMPLETENESS_DETAILS").to_pandas()
+                
+                # Debug: Show what columns are available
+                if st.checkbox("Show table structure for debugging", key="debug_hist_completeness"):
+                    st.write("Available columns in DQ_HISTORICAL_COMPLETENESS_DETAILS:")
+                    st.write(list(all_hist_completeness_details.columns))
+                    st.write("Sample data:")
+                    st.dataframe(all_hist_completeness_details.head())
+                
+                # Try to filter, but handle cases where expected columns might not exist
+                if not all_hist_completeness_details.empty:
+                    # Check if this table has the columns needed for brand filtering
+                    if 'RULE_NAME' in all_hist_completeness_details.columns:
+                        historical_completeness_pd_df = filter_df_by_brand(all_hist_completeness_details, data_brand)
+                    else:
+                        # If no RULE_NAME column, try to filter by other brand-related columns
+                        if 'DATASET_NAME' in all_hist_completeness_details.columns and data_brand != "__GLOBAL__":
+                            # Filter by dataset name containing the brand
+                            historical_completeness_pd_df = all_hist_completeness_details[
+                                all_hist_completeness_details['DATASET_NAME'].str.contains(data_brand, case=False, na=False)
+                            ]
+                        else:
+                            # Show all data if no filtering possible
+                            historical_completeness_pd_df = all_hist_completeness_details
+                else:
+                    historical_completeness_pd_df = pd.DataFrame()
+                    
+            except Exception as detail_error:
+                st.error(f"Could not load historical completeness data: {detail_error}")
+                st.error(f"Available tables and columns for debugging:")
+                # Show available columns in the table
+                try:
+                    table_info = session.sql("DESCRIBE TABLE DQ_HISTORICAL_COMPLETENESS_DETAILS").to_pandas()
+                    st.write("DQ_HISTORICAL_COMPLETENESS_DETAILS columns:")
+                    st.dataframe(table_info)
+                except Exception as describe_error:
+                    st.error(f"Could not describe table: {describe_error}")
+                historical_completeness_pd_df = pd.DataFrame()
+            
+            if not historical_completeness_pd_df.empty:
+                st.write(f"Found {len(historical_completeness_pd_df)} historical completeness detail(s):")
+                
+                # Check for data lag by comparing DATA_DATE with expected current date
+                if 'DATA_DATE' in historical_completeness_pd_df.columns:
+                    # Get the most recent data date and compare with expected (yesterday)
+                    from datetime import datetime, timedelta
+                    today = datetime.now().date()
+                    expected_date = today - timedelta(days=1)
+                    
+                    # Convert DATA_DATE to date for comparison
+                    historical_completeness_pd_df['DATA_DATE'] = pd.to_datetime(historical_completeness_pd_df['DATA_DATE']).dt.date
+                    most_recent_data_date = historical_completeness_pd_df['DATA_DATE'].max()
+                    
+                    if most_recent_data_date < expected_date:
+                        days_behind = (expected_date - most_recent_data_date).days
+                        st.warning(f"⚠️ **Data Freshness Notice:**")
+                        st.warning(f"📅 Data is {days_behind} day(s) behind expected date. Using {most_recent_data_date} instead of {expected_date}.")
+                        st.info(f"💡 The Historical Completeness rule automatically adjusts for data lag by using the most recent available date for calculations.")
+                        st.divider()
+                
+                # Add metrics for better visualization
+                if 'STATUS' in historical_completeness_pd_df.columns:
+                    pass_count = len(historical_completeness_pd_df[historical_completeness_pd_df['STATUS'] == 'PASS'])
+                    fail_count = len(historical_completeness_pd_df[historical_completeness_pd_df['STATUS'] == 'FAIL'])
+                    error_count = len(historical_completeness_pd_df[historical_completeness_pd_df['STATUS'] == 'ERROR'])
+                    
+                    metric_cols = st.columns(4)
+                    metric_cols[0].metric("Passed Checks", f"{pass_count}")
+                    metric_cols[1].metric("Failed Checks", f"{fail_count}", delta_color="inverse")
+                    metric_cols[2].metric("Error Checks", f"{error_count}", delta_color="inverse")
+                    
+                    # Show tolerance threshold info if available
+                    if 'TOLERANCE_THRESHOLD' in historical_completeness_pd_df.columns and not historical_completeness_pd_df.empty:
+                        tolerance_threshold = historical_completeness_pd_df['TOLERANCE_THRESHOLD'].iloc[0]
+                        metric_cols[3].metric("Tolerance Threshold", f"{tolerance_threshold:.1%}", 
+                                            help="Deviation percentage above this threshold triggers a failure")
+                
+                # Show error checks prominently
+                error_checks = historical_completeness_pd_df[historical_completeness_pd_df['STATUS'] == 'ERROR']
+                if not error_checks.empty:
+                    st.subheader("⚠️ Error Historical Completeness Checks")
+                    st.error(f"Found {len(error_checks)} dataset(s) with processing errors. This may indicate data access issues or missing data.")
+                    st.dataframe(error_checks)
+                    st.divider()
+                
+                # Show failed checks prominently
+                failed_checks = historical_completeness_pd_df[historical_completeness_pd_df['STATUS'] == 'FAIL']
+                if not failed_checks.empty:
+                    st.subheader("🚨 Failed Historical Completeness Checks")
+                    st.dataframe(failed_checks)
+                    st.divider()
+                
+                # Show all details
+                st.subheader("All Historical Completeness Results")
+                st.dataframe(historical_completeness_pd_df)
+                
+                # Show summary statistics if available
+                if 'DEVIATION_PERCENTAGE' in historical_completeness_pd_df.columns:
+                    st.subheader("Deviation Statistics")
+                    numeric_data = historical_completeness_pd_df[historical_completeness_pd_df['DEVIATION_PERCENTAGE'].notna()]
+                    if not numeric_data.empty:
+                        avg_deviation = numeric_data['DEVIATION_PERCENTAGE'].mean()
+                        max_deviation = numeric_data['DEVIATION_PERCENTAGE'].max()
+                        min_deviation = numeric_data['DEVIATION_PERCENTAGE'].min()
+                        
+                        stat_cols = st.columns(4)
+                        stat_cols[0].metric("Average Deviation", f"{avg_deviation:.4f}%")
+                        stat_cols[1].metric("Maximum Deviation", f"{max_deviation:.4f}%")
+                        stat_cols[2].metric("Minimum Deviation", f"{min_deviation:.4f}%")
+                        
+                        # Add rolling window analysis summary
+                        if 'TOLERANCE_THRESHOLD' in historical_completeness_pd_df.columns:
+                            tolerance_exceeded = len(historical_completeness_pd_df[
+                                historical_completeness_pd_df['DEVIATION_PERCENTAGE'] > 
+                                historical_completeness_pd_df['TOLERANCE_THRESHOLD']
+                            ])
+                            stat_cols[3].metric("Tolerance Violations", f"{tolerance_exceeded}", 
+                                              delta_color="inverse" if tolerance_exceeded > 0 else "normal")
+                
+                # Enhanced audit trail information if available
+                if not historical_completeness_pd_df.empty and 'DROPPED_DAY_DATE' in historical_completeness_pd_df.columns:
+                    st.subheader("Rolling Window Audit Trail")
+                    
+                    # Show audit columns in a more organized way
+                    audit_cols = ['DATASET_NAME', 'DATA_DATE', 'DROPPED_DAY_DATE', 'DROPPED_DAY_COUNT', 
+                                'NEWEST_DAY_COUNT', 'PREVIOUS_CUMULATIVE_COUNT', 'ACTUAL_60_DAY_COUNT', 
+                                'EXPECTED_60_DAY_COUNT', 'DEVIATION']
+                    available_audit_cols = [col for col in audit_cols if col in historical_completeness_pd_df.columns]
+                    
+                    if available_audit_cols:
+                        st.write("**Rolling Window Calculation Details:**")
+                        st.dataframe(historical_completeness_pd_df[available_audit_cols], use_container_width=True)
+                        
+                        # Explain the calculation
+                        st.info("💡 **Rolling Window Logic**: Expected Count = Previous 59-Day Total - Dropped Day (Day 61) + Newest Day. This ensures consistent 60-day window monitoring.")
+            else:
+                st.success(f"No historical completeness issues found for {display_brand} in DQ_HISTORICAL_COMPLETENESS_DETAILS table.")
+                
+        except Exception as e:
+            st.error(f"Could not load historical completeness data: {e}")
+            st.write("Available tables and columns for debugging:")
+            try:
+                # Show available tables for debugging
+                tables_df = session.sql("SHOW TABLES LIKE 'DQ%'").to_pandas()
+                st.write("Available DQ tables:")
+                st.dataframe(tables_df)
+            except Exception as table_err:
+                st.error(f"Could not show tables: {table_err}")
+    
+    # AI Summary for Historical Completeness
+    generate_ai_insights_for_tab(
+        data_df=historical_completeness_pd_df[historical_completeness_pd_df['STATUS'] == 'FAIL'] if not historical_completeness_pd_df.empty and 'STATUS' in historical_completeness_pd_df.columns else pd.DataFrame(),
+        analysis_type="Historical Completeness",
+        brand_name=display_brand,
+        relevant_cols=['DATASET_NAME', 'DATA_DATE', 'ACTUAL_60_DAY_COUNT', 'EXPECTED_60_DAY_COUNT', 'DEVIATION', 'DEVIATION_PERCENTAGE', 'STATUS', 'TOLERANCE_THRESHOLD'],
+        full_data_df=historical_completeness_pd_df
+    )
+
+# --- TAB 5: Sustained Trend Details ---
+with tab5:
     st.header("Sustained Trend Details")
     details_pd_df = pd.DataFrame() 
     with st.spinner("Loading trend details..."):
@@ -508,15 +985,13 @@ with tab4:
         except Exception as e:
             st.error(f"Could not load data from DQ_SUSTAINED_TREND_DETAILS table: {e}")
             
-    generate_ai_summary_for_tab(
+    generate_ai_insights_for_sustained_trends(
         data_df=details_pd_df,
-        analysis_type="Sustained Trends",
-        brand_name=display_brand,
-        relevant_cols=['SEGMENT_VALUES', 'TREND_LENGTH']
+        brand_name=display_brand
     )
 
-# --- TAB 5: Missing Data Details ---
-with tab5:
+# --- TAB 6: Missing Data Details ---
+with tab6:
     st.header("Missing Data & Nulls Details")
     missing_data_pd_df = pd.DataFrame()
     with st.spinner("Loading missing data and null violation details..."):
@@ -531,15 +1006,15 @@ with tab5:
         except Exception as e:
             st.error(f"Could not load data from DQ_DETAILS_MISSING_DATA: {e}")
 
-    generate_ai_summary_for_tab(
+    generate_ai_insights_for_tab(
         data_df=missing_data_pd_df,
         analysis_type="Missing Data and Null Violations",
         brand_name=display_brand,
         relevant_cols=['FAILURE_TYPE', 'FAILURE_DATE', 'DETAILS']
     )
 
-# --- TAB 6: Spike / Dip Details ---
-with tab6:
+# --- TAB 7: Spike / Dip Details ---
+with tab7:
     st.header("Spike and Dip Details")
     st.subheader("Graphical View of Spikes & Dips")
     spike_dip_brand_df = pd.DataFrame()
@@ -585,13 +1060,13 @@ with tab6:
         except Exception as e:
             st.error(f"Could not load or plot spike/dip data: {e}", icon="🚨")
 
-    generate_ai_summary_for_spike_dip(
+    generate_ai_insights_for_spike_dip(
         data_df=spike_dip_brand_df,
         brand_name=display_brand
     )
 
-# --- TAB 7: Sigma & Anomaly Analysis (MERGED) ---
-with tab7:
+# --- TAB 8: Sigma & Anomaly Analysis (MERGED) ---
+with tab8:
     st.header(f"Sigma & Anomaly Analysis for {display_brand}")
     analysis_choice = st.selectbox(
         "Choose Analysis Type:",
@@ -657,7 +1132,7 @@ with tab7:
             except Exception as e:
                 st.error(f"An error occurred while generating the 3-sigma chart: {e}")
 
-        generate_ai_summary_for_tab(data_df=sigma_outliers, analysis_type="3 Sigma Outliers", brand_name=display_brand, relevant_cols=['ORDER_DATE', 'Actual Orders', '+3 Sigma', '-3 Sigma', 'Zone'])
+        generate_ai_insights_for_tab(data_df=sigma_outliers, analysis_type="3 Sigma Outlier Analysis", brand_name=display_brand, relevant_cols=['ORDER_DATE', 'Actual Orders', '+3 Sigma', '-3 Sigma', 'Zone'])
         
     elif analysis_choice == "2 to 3 Sigma Anomaly Detection (Snowflake ML)":
         st.markdown("This chart identifies 'warning' data points that fall between the 2nd and 3rd standard deviations from the 60-day rolling average. These points are highlighted in amber.")
@@ -699,7 +1174,7 @@ with tab7:
             except Exception as e:
                 st.error(f"An error occurred while generating the 2-to-3 sigma warning chart: {e}")
 
-        generate_ai_summary_for_tab(data_df=anomalies_pd_df, analysis_type="2-to-3 Sigma Warning Zone Events", brand_name=display_brand, relevant_cols=['ORDER_DATE', 'Actual Orders', '60-Day Rolling Average', 'Zone'])
+        generate_ai_insights_for_tab(data_df=anomalies_pd_df, analysis_type="2-to-3 Sigma Warning Analysis", brand_name=display_brand, relevant_cols=['ORDER_DATE', 'Actual Orders', '60-Day Rolling Average', 'Zone'])
 
 # --- Global AI Help Section at the Bottom ---
 st.divider()
