@@ -18,6 +18,9 @@ def main(session: Session):
     Orchestrates the execution of data quality rules by reading from RULE_CATALOG
     and dispatching to appropriate rule execution functions.
     """
+    # Add this line to disable Snowflake's result cache for this session
+    session.sql("ALTER SESSION SET USE_CACHED_RESULT = FALSE").collect()
+    
     print("Starting data quality rule execution...")
     dq_results_table_name = "DQ_RESULTS"
     try:
@@ -40,6 +43,46 @@ def main(session: Session):
             )"""
             session.sql(create_table_sql).collect()
             print(f"Table '{dq_results_table_name}' created.")
+
+        # Create DQ_DETAILS_COMPLETENESS table if it doesn't exist
+        details_completeness_table = "DQ_DETAILS_COMPLETENESS"
+        try:
+            session.sql(f"SELECT 1 FROM {details_completeness_table} LIMIT 1").collect()
+        except SnowparkSQLException:
+            print(f"DQ_DETAILS_COMPLETENESS table does not exist. Creating it.")
+            create_details_table_sql = f"""
+            CREATE OR REPLACE TABLE {details_completeness_table} (
+            RULE_NAME VARCHAR(255) NOT NULL,
+            EXPECTED_DATE VARCHAR(255),
+            ACTUAL_MAX_DATE VARCHAR(255),
+            DAYS_MISSING INT,
+            EXECUTION_TIMESTAMP TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+            )"""
+            session.sql(create_details_table_sql).collect()
+            print(f"Table '{details_completeness_table}' created.")
+            
+        # Also check if the table exists but has wrong schema - recreate it
+        try:
+            # Test insert with our expected data format
+            test_df = session.create_dataframe([
+                ("TEST", "2025-01-01", "N/A - Count Check", 0)
+            ], schema=["RULE_NAME", "EXPECTED_DATE", "ACTUAL_MAX_DATE", "DAYS_MISSING"])
+            test_df.with_column("EXECUTION_TIMESTAMP", current_timestamp()).write.mode("append").save_as_table(details_completeness_table)
+            # If successful, remove the test record
+            session.sql(f"DELETE FROM {details_completeness_table} WHERE RULE_NAME = 'TEST'").collect()
+        except SnowparkSQLException as schema_error:
+            if "Date" in str(schema_error) and "not recognized" in str(schema_error):
+                print(f"DQ_DETAILS_COMPLETENESS table has incompatible schema. Recreating it.")
+                create_details_table_sql = f"""
+                CREATE OR REPLACE TABLE {details_completeness_table} (
+                RULE_NAME VARCHAR(255) NOT NULL,
+                EXPECTED_DATE VARCHAR(255),
+                ACTUAL_MAX_DATE VARCHAR(255),
+                DAYS_MISSING INT,
+                EXECUTION_TIMESTAMP TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+                )"""
+                session.sql(create_details_table_sql).collect()
+                print(f"Table '{details_completeness_table}' recreated with correct schema.")
 
         for rule_row in rule_catalog_rows:
             try:
@@ -67,6 +110,9 @@ def main(session: Session):
                 # NEW DISPATCH: UNIQUENESS rule with SNOWPARK_FUNC (for duplicate checks)
                 elif rule_type == 'UNIQUENESS' and logic_implementation == 'SNOWPARK_FUNC':
                     dqlib.execute_duplicate_check(session, rule_row, dq_results_table_name)
+                # NEW DISPATCH: NEGATIVE_VALUE_CHECK rule
+                elif rule_type == 'NEGATIVE_VALUE_CHECK' and logic_implementation == 'SNOWPARK_FUNC':
+                    dqlib.execute_negative_value_check(session, rule_row, dq_results_table_name)
                 elif logic_implementation == 'CORTEX_DETECT_ANOMALIES':
                     dqlib.execute_detect_anomalies(session, rule_row, dq_results_table_name)
                 elif logic_implementation == 'SNOWPARK_FUNC':

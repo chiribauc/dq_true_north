@@ -1,7 +1,7 @@
 # dq_rules_library.py
 import snowflake.snowpark as snowpark
 from snowflake.snowpark import Session, Row
-from snowflake.snowpark.functions import col, count, when, lit, avg, stddev, lag, sum as snowpark_sum, dateadd, current_date, to_utc_timestamp, object_construct, current_timestamp, abs, to_date, concat_ws, coalesce, upper, round
+from snowflake.snowpark.functions import col, count, when, lit, avg, stddev, lag, sum as snowpark_sum, dateadd, current_date, to_utc_timestamp, object_construct, current_timestamp, abs as snowpark_abs, to_date, concat_ws, coalesce, upper, round as snowpark_round
 from snowflake.snowpark.exceptions import SnowparkSQLException
 from snowflake.snowpark.window import Window
 import pandas as pd
@@ -102,34 +102,67 @@ def execute_sql_rule(session: Session, rule_row: Row, dq_results_table: str) -> 
             logger.info(f"Executing COMPLETENESS rule with inline SQL: {rule_name}.")
             
             collected_results = session.sql(logic_definition).collect()
+            logger.info(f"COMPLETENESS rule '{rule_name}' collected {len(collected_results)} results")
+            if collected_results:
+                logger.info(f"First result row length: {len(collected_results[0])}, content: {collected_results[0]}")
             
             final_indicator, result_value, error_message = "PASS", 0, None
             if collected_results and collected_results[0][0] is not None:
                 result_value = collected_results[0][0]
                 final_indicator = "FAIL" if result_value > 0 else "PASS"
+                logger.info(f"COMPLETENESS rule '{rule_name}' result_value: {result_value}, indicator: {final_indicator}")
             elif collected_results:
                 error_message = f"Completeness check query for '{rule_name}' returned a NULL result."
                 final_indicator = "FAIL"
                 result_value = "NULL_RESULT"
+                logger.warning(f"COMPLETENESS rule '{rule_name}' returned NULL result")
             else:
                 error_message = f"Completeness check query for '{rule_name}' returned no results."
                 final_indicator = "ERROR"
                 result_value = "NO_RESULTS"
+                logger.error(f"COMPLETENESS rule '{rule_name}' returned no results")
             
             log_dq_result(session, dq_results_table, rule_id, rule_name, segment_value, rule_type, logic_implementation, result_value, final_indicator, error_message)
             
-            if collected_results and len(collected_results[0]) == 4:
-                try:
+            # Always log to details table for completeness checks
+            logger.info(f"Starting detail logging for COMPLETENESS rule '{rule_name}'")
+            try:
+                if collected_results and len(collected_results[0]) == 4:
+                    # Handle 4-column results (rule_name, expected_date, actual_max_date, days_missing)
+                    logger.info(f"Processing 4-column result for rule '{rule_name}'")
                     result_row = collected_results[0]
                     detail_log_df = session.create_dataframe([
                         (result_row[0], result_row[1], result_row[2], result_row[3])
                     ], schema=["RULE_NAME", "EXPECTED_DATE", "ACTUAL_MAX_DATE", "DAYS_MISSING"])
+                elif collected_results and len(collected_results[0]) == 1:
+                    # Handle single-column results (count only) - create meaningful detail record
+                    logger.info(f"Processing 1-column result for rule '{rule_name}'")
+                    count_value = collected_results[0][0] if collected_results[0][0] is not None else 0
                     
+                    # Calculate expected date (yesterday) and create a meaningful detail record
+                    yesterday_date = session.sql("SELECT DATEADD(day, -1, CURRENT_DATE()) as yesterday").collect()[0]['YESTERDAY']
+                    logger.info(f"Yesterday date calculated as: {yesterday_date}, count_value: {count_value}")
+                    
+                    detail_log_df = session.create_dataframe([
+                        (rule_name, str(yesterday_date), "N/A - Count Check", count_value)
+                    ], schema=["RULE_NAME", "EXPECTED_DATE", "ACTUAL_MAX_DATE", "DAYS_MISSING"])
+                else:
+                    # No valid results to log to details
+                    logger.warning(f"No valid results to log details for rule '{rule_name}'. Results length: {len(collected_results[0]) if collected_results else 'No results'}")
+                    detail_log_df = None
+                
+                if detail_log_df is not None:
+                    logger.info(f"About to save detail log for rule '{rule_name}' to DQ_DETAILS_COMPLETENESS")
                     final_detail_log_df = detail_log_df.with_column("EXECUTION_TIMESTAMP", current_timestamp())
                     final_detail_log_df.write.mode("append").save_as_table("DQ_DETAILS_COMPLETENESS")
-                except Exception as detail_log_err:
-                    error_message = f"Failed to log detailed completeness check for '{rule_name}': {detail_log_err}"
-                    logger.error(error_message, exc_info=True)
+                    logger.info(f"Successfully logged completeness details for rule '{rule_name}' to DQ_DETAILS_COMPLETENESS")
+                else:
+                    logger.warning(f"detail_log_df is None for rule '{rule_name}', skipping detail logging")
+                    
+            except Exception as detail_log_err:
+                error_message = f"Failed to log detailed completeness check for '{rule_name}': {detail_log_err}"
+                logger.error(error_message, exc_info=True)
+                print(f"ERROR logging details for '{rule_name}': {detail_log_err}")
         
         elif rule_type == 'ROLLING_AVERAGE':
             logger.info(f"Executing ROLLING_AVERAGE rule: {rule_name}.")
@@ -277,7 +310,7 @@ def execute_duplicate_check(session: Session, rule_row: Row, dq_results_table: s
                 group_by_exprs.append(upper(col(c)).alias(c))
             elif c in numeric_columns_to_round:
                 decimals = numeric_columns_to_round[c]
-                group_by_exprs.append(round(col(c), decimals).alias(c))
+                group_by_exprs.append(snowpark_round(col(c), decimals).alias(c))
             else:
                 group_by_exprs.append(col(c))
 
@@ -524,7 +557,7 @@ def execute_spike_dip_check(session: Session, rule_row: Row, dq_results_table: s
 
         # 3. Identify all spikes/dips for the details table
         all_spikes_dips_df = df_with_change.filter(
-            col("pct_change").isNotNull() & (abs(col("pct_change")) >= threshold)
+            col("pct_change").isNotNull() & (snowpark_abs(col("pct_change")) >= threshold)
         )
 
         # 4. Log all detected spikes/dips to the details table
@@ -562,7 +595,7 @@ def execute_spike_dip_check(session: Session, rule_row: Row, dq_results_table: s
         
         # Filter to find segments where the latest point is a spike/dip
         latest_spikes = latest_points_df.filter(
-            col("pct_change").isNotNull() & (abs(col("pct_change")) >= threshold)
+            col("pct_change").isNotNull() & (snowpark_abs(col("pct_change")) >= threshold)
         ).collect()
 
         count_of_latest_spikes = len(latest_spikes)
@@ -595,6 +628,103 @@ def execute_spike_dip_check(session: Session, rule_row: Row, dq_results_table: s
         error_message = f"Error executing Snowpark spike/dip rule '{rule_name}': {e}"
         logger.error(error_message, exc_info=True)
         log_dq_result(session, dq_results_table, rule_id, rule_name, "EXECUTION_ERROR", rule_type, logic_implementation, "ERROR", "ERROR", error_message)
+
+
+# --- NEGATIVE VALUE CHECK RULE EXECUTION (SNOWPARK) ---
+def execute_negative_value_check(session: Session, rule_row: Row, dq_results_table: str) -> None:
+    """
+    Executes a negative value check using Snowpark DataFrames.
+    Identifies records where specified numeric columns contain negative values (< 0).
+    Logs detailed information about each negative value found including:
+    - Record ID, timestamp, field name, and actual negative value
+    """
+    rule_id, rule_name = getattr(rule_row, 'RULE_ID', None), getattr(rule_row, 'RULE_NAME', 'UNKNOWN_NEGATIVE_VALUE_RULE')
+    logic_implementation = getattr(rule_row, 'LOGIC_IMPLEMENTATION', 'SNOWPARK_FUNC')
+    rule_type = getattr(rule_row, 'RULE_TYPE', 'NEGATIVE_VALUE_CHECK')
+    parameters_str = getattr(rule_row, 'PARAMETERS', '{}')
+    logger.info(f"Executing Negative Value check rule: {rule_name}")
+
+    try:
+        # 1. Parse and Validate Parameters
+        params = json.loads(parameters_str)
+        source_table = params.get("source_table")
+        details_table = params.get("details_table")
+        numeric_columns = params.get("numeric_columns", [])
+        id_column = params.get("id_column") # For single column ID
+        id_columns = params.get("id_columns") # For composite ID
+        timestamp_column = params.get("timestamp_column", "CREATED_DATE")
+
+        if not all([source_table, details_table]) or not numeric_columns:
+            raise ValueError("Missing required parameters: source_table, details_table, and numeric_columns must be provided")
+        
+        if not id_column and not id_columns:
+            raise ValueError("Either 'id_column' or 'id_columns' must be provided in the rule parameters")
+
+        # 2. Get source data
+        df = session.table(source_table)
+
+        # Determine the ID expression
+        if id_columns:
+            id_expr = concat_ws(lit("-"), *[col(c) for c in id_columns]).alias("RECORD_ID")
+        else:
+            id_expr = col(id_column).alias("RECORD_ID")
+        
+        # 3. Check each numeric column for negative values
+        total_negative_count = 0
+        
+        for column in numeric_columns:
+            try:
+                # Filter records where the column value is negative
+                negative_df = df.filter(col(column) < 0).select(
+                    id_expr,
+                    col(timestamp_column).alias("RECORD_TIMESTAMP"), 
+                    lit(column).alias("FIELD_NAME"),
+                    col(column).alias("NEGATIVE_VALUE"),
+                    current_timestamp().alias("DETECTION_TIMESTAMP"),
+                    lit(rule_id).alias("RULE_ID"),
+                    lit(rule_name).alias("RULE_NAME")
+                )
+                
+                negative_count = negative_df.count()
+                if negative_count > 0:
+                    logger.info(f"Found {negative_count} negative values in column '{column}'")
+                    total_negative_count += negative_count
+                    
+                    # Log detailed records to details table
+                    negative_df.write.mode("append").save_as_table(details_table)
+                    logger.info(f"Logged {negative_count} negative value records for column '{column}' to '{details_table}'")
+                    
+            except Exception as col_error:
+                logger.warning(f"Error checking column '{column}' for negative values: {col_error}")
+                continue
+
+        # 4. Log summary result to main DQ_RESULTS table
+        final_indicator = "FAIL" if total_negative_count > 0 else "PASS"
+        error_message = f"Found {total_negative_count} negative values across {len(numeric_columns)} columns" if total_negative_count > 0 else None
+        
+        log_dq_result(
+            session=session,
+            dq_results_table=dq_results_table,
+            rule_id=rule_id,
+            rule_name=rule_name,
+            segment_value=f"Columns: {', '.join(numeric_columns)}",
+            rule_type=rule_type,
+            logic_implementation=logic_implementation,
+            result_value=total_negative_count,
+            indicator=final_indicator,
+            error_message=error_message
+        )
+
+        logger.info(f"Negative Value check completed. Total negative values found: {total_negative_count}")
+
+    except (json.JSONDecodeError, ValueError) as e:
+        error_message = f"Configuration error for Negative Value rule '{rule_name}': {e}"
+        logger.error(error_message)
+        log_dq_result(session, dq_results_table, rule_id, rule_name, 'CONFIG_ERROR', rule_type, logic_implementation, "ERROR", "ERROR", error_message)
+    except Exception as e:
+        error_message = f"Error executing Negative Value check for '{rule_name}': {e}"
+        logger.error(error_message, exc_info=True)
+        log_dq_result(session, dq_results_table, rule_id, rule_name, 'EXECUTION_ERROR', rule_type, logic_implementation, "ERROR", "ERROR", error_message)
 
 
 # --- ANOMALY DETECTION RULE EXECUTION (CORTEX) --- [FINAL CORRECTED FUNCTION]
@@ -704,23 +834,92 @@ def execute_historical_completeness_check(session: Session, rule_row: Row, dq_re
         if not all([source_table, details_table, date_column, count_column, dataset_column]):
             raise ValueError("Missing required keys in PARAMETERS JSON (source_table, details_table, date_column, count_column, dataset_column).")
 
-        # 2. Setup date ranges
+        # 2. Setup date ranges with fallback logic
         dates_df = session.sql(f"""
             SELECT 
                 CURRENT_DATE() as today,
-                DATEADD(day, -1, CURRENT_DATE()) as newest_day,
-                DATEADD(day, -{lookback_days + 1}, CURRENT_DATE()) as dropped_day,
-                DATEADD(day, -{lookback_days}, CURRENT_DATE()) as window_start
+                DATEADD(day, -1, CURRENT_DATE()) as expected_newest_day,
+                DATEADD(day, -{lookback_days + 1}, CURRENT_DATE()) as expected_dropped_day,
+                DATEADD(day, -{lookback_days}, CURRENT_DATE()) as expected_window_start
         """).collect()
         
-        newest_day = dates_df[0]['NEWEST_DAY']
-        dropped_day = dates_df[0]['DROPPED_DAY']
-        window_start = dates_df[0]['WINDOW_START']
+        expected_newest_day = dates_df[0]['EXPECTED_NEWEST_DAY']
+        expected_dropped_day = dates_df[0]['EXPECTED_DROPPED_DAY']
+        expected_window_start = dates_df[0]['EXPECTED_WINDOW_START']
+        
+        # Check if yesterday's data exists, if not use the maximum available date
+        df = session.table(source_table).with_column(date_column, to_date(col(date_column)))
+        
+        # Debug: Let's see what data is actually in the table
+        logger.info("=== DEBUGGING DATA AVAILABILITY ===")
+        try:
+            sample_data = df.limit(5).collect()
+            logger.info(f"Sample data from {source_table}: {sample_data}")
+            
+            date_range = df.agg({date_column: "min", date_column: "max"}).collect()
+            logger.info(f"Date range in {source_table}: {date_range}")
+            
+            unique_brands = df.select(dataset_column).distinct().collect()
+            logger.info(f"Unique brands in {source_table}: {unique_brands}")
+            
+        except Exception as debug_error:
+            logger.error(f"Error during debug data check: {debug_error}")
+        logger.info("=== END DEBUGGING ===")
+        
+        # Check for yesterday's data
+        yesterday_check = df.filter(col(date_column) == lit(expected_newest_day)).count()
+        logger.info(f"Records found for expected date {expected_newest_day}: {yesterday_check}")
+        
+        data_lag_message = None
+        if yesterday_check == 0:
+            # No data for yesterday, find the maximum available date
+            logger.info(f"No data found for expected date {expected_newest_day}, falling back to maximum available date")
+            
+            try:
+                # Use a more robust way to get the max date
+                max_date_query = f"SELECT MAX({date_column}) as max_date FROM {source_table}"
+                max_date_result = session.sql(max_date_query).collect()
+                
+                if max_date_result and len(max_date_result) > 0:
+                    actual_newest_day = max_date_result[0]['MAX_DATE']
+                    logger.info(f"Found maximum date: {actual_newest_day}")
+                else:
+                    raise ValueError(f"Could not determine maximum date from {source_table}")
+                
+                if actual_newest_day is None:
+                    raise ValueError(f"No data found in table {source_table}")
+                
+                # Calculate dates based on actual newest day using SQL for reliability
+                date_calc_query = f"""
+                SELECT 
+                    '{actual_newest_day}'::DATE as newest_day,
+                    DATEADD(day, -{lookback_days + 1}, '{actual_newest_day}'::DATE) as dropped_day,
+                    DATEADD(day, -{lookback_days}, '{actual_newest_day}'::DATE) as window_start,
+                    DATEDIFF(day, '{actual_newest_day}'::DATE, '{expected_newest_day}'::DATE) as days_behind
+                """
+                date_calc_result = session.sql(date_calc_query).collect()[0]
+                
+                newest_day = date_calc_result['NEWEST_DAY']
+                dropped_day = date_calc_result['DROPPED_DAY']
+                window_start = date_calc_result['WINDOW_START']
+                days_behind = date_calc_result['DAYS_BEHIND']
+                
+                data_lag_message = f"Data is {days_behind} day(s) behind expected date. Using {actual_newest_day} instead of {expected_newest_day}."
+                logger.warning(data_lag_message)
+                
+            except Exception as fallback_error:
+                logger.error(f"Error in fallback date logic: {fallback_error}")
+                raise ValueError(f"Could not determine valid dates for analysis: {fallback_error}")
+        else:
+            # Use expected dates (yesterday's data exists)
+            newest_day = expected_newest_day
+            dropped_day = expected_dropped_day
+            window_start = expected_window_start
+            logger.info(f"Data is up-to-date. Using expected date {expected_newest_day}")
         
         logger.info(f"Checking historical completeness for newest day: {newest_day}, window start: {window_start}, dropped day: {dropped_day}")
 
         # 3. Get the source data and prepare for analysis
-        df = session.table(source_table).with_column(date_column, to_date(col(date_column)))
         
         # 4. Get unique datasets to process
         datasets = df.select(dataset_column).distinct().collect()
@@ -749,63 +948,128 @@ def execute_historical_completeness_check(session: Session, rule_row: Row, dq_re
             try:
                 # Filter data for current dataset
                 dataset_df = df.filter(col(dataset_column) == lit(dataset_name))
+                logger.info(f"Processing dataset: {dataset_name}")
                 
-                # Get the newest day count
-                newest_day_df = dataset_df.filter(col(date_column) == lit(newest_day))
-                newest_day_count = newest_day_df.count()
+                # Debug: Check if we have any data for this dataset
+                total_records = dataset_df.count()
+                logger.info(f"Total records for dataset {dataset_name}: {total_records}")
                 
-                if newest_day_count == 0:
+                # Get the newest day count - handle multiple rows by summing
+                try:
+                    newest_day_query = f"""
+                    SELECT SUM({count_column}) as daily_total
+                    FROM {source_table} 
+                    WHERE {date_column} = '{newest_day}' 
+                    AND {dataset_column} = '{dataset_name}'
+                    """
+                    newest_result = session.sql(newest_day_query).collect()
+                    logger.info(f"Newest day query result for {dataset_name}: {newest_result}")
+                    
+                    if newest_result and len(newest_result) > 0 and newest_result[0]['DAILY_TOTAL'] is not None:
+                        newest_record_count = newest_result[0]['DAILY_TOTAL']
+                    else:
+                        newest_record_count = 0
+                        
+                except Exception as newest_error:
+                    logger.error(f"Error getting newest day count for {dataset_name}: {newest_error}")
                     newest_record_count = 0
-                else:
-                    newest_record_count = newest_day_df.select(count_column).collect()[0][0] or 0
                 
-                # Get the dropped day count (61st day)
-                dropped_day_df = dataset_df.filter(col(date_column) == lit(dropped_day))
-                dropped_day_count = dropped_day_df.count()
+                logger.info(f"Newest day record count for {dataset_name}: {newest_record_count}")
                 
-                if dropped_day_count == 0:
+                # Get the dropped day count - handle multiple rows by summing
+                try:
+                    dropped_day_query = f"""
+                    SELECT SUM({count_column}) as daily_total
+                    FROM {source_table} 
+                    WHERE {date_column} = '{dropped_day}' 
+                    AND {dataset_column} = '{dataset_name}'
+                    """
+                    dropped_result = session.sql(dropped_day_query).collect()
+                    logger.info(f"Dropped day query result for {dataset_name}: {dropped_result}")
+                    
+                    if dropped_result and len(dropped_result) > 0 and dropped_result[0]['DAILY_TOTAL'] is not None:
+                        dropped_record_count = dropped_result[0]['DAILY_TOTAL']
+                    else:
+                        dropped_record_count = 0
+                        
+                except Exception as dropped_error:
+                    logger.error(f"Error getting dropped day count for {dataset_name}: {dropped_error}")
                     dropped_record_count = 0
-                else:
-                    dropped_record_count = dropped_day_df.select(count_column).collect()[0][0] or 0
                 
-                # Get previous 60-day window (excluding newest day)
-                previous_window_df = dataset_df.filter(
-                    (col(date_column) >= lit(window_start)) & 
-                    (col(date_column) < lit(newest_day))
-                )
+                logger.info(f"Dropped day record count for {dataset_name}: {dropped_record_count}")
                 
-                # Calculate previous cumulative count
-                previous_cumulative_records = previous_window_df.agg(
-                    snowpark_sum(col(count_column)).alias("total_count")
-                ).collect()
+                # Calculate previous cumulative count - simplified approach
+                try:
+                    previous_cumulative_query = f"""
+                    SELECT SUM({count_column}) as total_count
+                    FROM {source_table} 
+                    WHERE {date_column} >= '{window_start}' 
+                    AND {date_column} < '{newest_day}'
+                    AND {dataset_column} = '{dataset_name}'
+                    """
+                    previous_cumulative_result = session.sql(previous_cumulative_query).collect()
+                    logger.info(f"Previous cumulative query result for {dataset_name}: {previous_cumulative_result}")
+                    
+                    if previous_cumulative_result and len(previous_cumulative_result) > 0:
+                        total_count_value = previous_cumulative_result[0]['TOTAL_COUNT']
+                        previous_cumulative_count = total_count_value if total_count_value is not None else 0
+                    else:
+                        previous_cumulative_count = 0
+                except Exception as prev_cumulative_error:
+                    logger.error(f"Error calculating previous cumulative count for {dataset_name}: {prev_cumulative_error}")
+                    previous_cumulative_count = 0
                 
-                previous_cumulative_count = previous_cumulative_records[0]['TOTAL_COUNT'] or 0
+                logger.info(f"Previous cumulative count for {dataset_name}: {previous_cumulative_count}")
                 
-                # Calculate actual current 60-day window count
-                current_window_df = dataset_df.filter(
-                    (col(date_column) >= lit(window_start)) & 
-                    (col(date_column) <= lit(newest_day))
-                )
+                # Calculate actual current 60-day window count - simplified approach
+                try:
+                    actual_60_day_query = f"""
+                    SELECT SUM({count_column}) as total_count
+                    FROM {source_table} 
+                    WHERE {date_column} >= '{window_start}' 
+                    AND {date_column} <= '{newest_day}'
+                    AND {dataset_column} = '{dataset_name}'
+                    """
+                    actual_60_day_result = session.sql(actual_60_day_query).collect()
+                    logger.info(f"Actual 60-day query result for {dataset_name}: {actual_60_day_result}")
+                    
+                    if actual_60_day_result and len(actual_60_day_result) > 0:
+                        total_count_value = actual_60_day_result[0]['TOTAL_COUNT']
+                        actual_60_day_count = total_count_value if total_count_value is not None else 0
+                    else:
+                        actual_60_day_count = 0
+                except Exception as actual_60_error:
+                    logger.error(f"Error calculating actual 60-day count for {dataset_name}: {actual_60_error}")
+                    actual_60_day_count = 0
                 
-                actual_60_day_records = current_window_df.agg(
-                    snowpark_sum(col(count_column)).alias("total_count")
-                ).collect()
+                logger.info(f"Actual 60-day count for {dataset_name}: {actual_60_day_count}")
                 
-                actual_60_day_count = actual_60_day_records[0]['TOTAL_COUNT'] or 0
-                
-                # Calculate expected count: previous_cumulative - dropped_day + newest_day
+                # REQUIREMENTS LOGIC: Rolling 60-day window consistency check
+                # Expected = Previous_Cumulative_59_Days - Dropped_Day_60 + Newest_Day_60
                 expected_60_day_count = previous_cumulative_count - dropped_record_count + newest_record_count
                 
-                # Calculate deviation
+                logger.info(f"Expected 60-day count for {dataset_name}: {expected_60_day_count} (previous: {previous_cumulative_count} - dropped: {dropped_record_count} + newest: {newest_record_count})")
+                
+                # Calculate deviation between actual vs expected rolling window
                 deviation = actual_60_day_count - expected_60_day_count
-                deviation_percentage = (abs(deviation) / expected_60_day_count) if expected_60_day_count != 0 else 0
+                
+                # Handle division by zero case
+                if expected_60_day_count != 0:
+                    deviation_percentage = abs(deviation) / expected_60_day_count
+                else:
+                    deviation_percentage = 0.0
+                    logger.warning(f"Expected count is zero for {dataset_name}, setting deviation percentage to 0")
+                
+                logger.info(f"Deviation for {dataset_name}: {deviation} ({deviation_percentage:.4f}%)")
                 
                 # Determine status
                 status = "FAIL" if deviation_percentage > tolerance_threshold else "PASS"
                 if status == "FAIL":
                     total_failed_datasets += 1
                 
-                # Log detailed results to details table
+                logger.info(f"Status for {dataset_name}: {status}")
+                
+                # Log detailed results - following audit trail requirements per spec
                 detail_data = {
                     "EXECUTION_ID": execution_id,
                     "RULE_ID": rule_id,
@@ -814,13 +1078,14 @@ def execute_historical_completeness_check(session: Session, rule_row: Row, dq_re
                     "ACTUAL_60_DAY_COUNT": actual_60_day_count,
                     "EXPECTED_60_DAY_COUNT": expected_60_day_count,
                     "DEVIATION": deviation,
-                    "DEVIATION_PERCENTAGE": round(deviation_percentage, 4),
+                    "DEVIATION_PERCENTAGE": float(round(deviation_percentage, 4)),
                     "TOLERANCE_THRESHOLD": tolerance_threshold,
                     "STATUS": status,
                     "DROPPED_DAY_DATE": dropped_day,
                     "DROPPED_DAY_COUNT": dropped_record_count,
                     "NEWEST_DAY_COUNT": newest_record_count,
                     "PREVIOUS_CUMULATIVE_COUNT": previous_cumulative_count
+                    # Comprehensive audit trail as per requirements
                 }
                 
                 details_df = session.create_dataframe([detail_data], schema=list(detail_data.keys()))
