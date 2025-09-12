@@ -621,7 +621,11 @@ st.header(f"{display_brand} - {selected_metric}")
 
 # --- 5. Main Dashboard Tabs ---
 # *** Updated to reflect all rule types from the library ***
+<<<<<<< HEAD
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
+=======
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+>>>>>>> abfb5cf707a50beb61ea9032b0c78bb114d8259e
     "Summary", 
     "Uniqueness / Duplicate Details", 
     "Completeness Details",
@@ -1240,6 +1244,7 @@ with tab8:
                 st.error(f"An error occurred while generating the 2-to-3 sigma warning chart: {e}")
 
         generate_ai_insights_for_tab(data_df=anomalies_pd_df, analysis_type="2-to-3 Sigma Warning Analysis", brand_name=display_brand, relevant_cols=['ORDER_DATE', 'Actual Orders', '60-Day Rolling Average', 'Zone'])
+<<<<<<< HEAD
 
 # --- TAB 9: Negative Value Details ---
 with tab9:
@@ -1449,6 +1454,8 @@ with tab9:
             brand_name=display_brand, 
             relevant_cols=['FIELD_NAME', 'NEGATIVE_VALUE', 'RECORD_ID', 'DETECTION_TIMESTAMP']
         )
+=======
+>>>>>>> abfb5cf707a50beb61ea9032b0c78bb114d8259e
 
 # --- Global AI Help Section at the Bottom ---
 st.divider()
