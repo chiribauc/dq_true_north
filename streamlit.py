@@ -1243,212 +1243,30 @@ with tab8:
 
 # --- TAB 9: Negative Value Details ---
 with tab9:
-    st.subheader(f"🚨 Negative Value Violations - {display_brand}")
-    st.write("This tab shows records where numeric fields contain negative values, which may indicate data quality issues.")
+    st.header("Negative Value Check")
     
-    with st.spinner(f"Loading negative value violations for {display_brand}..."):
+    with st.spinner(f"Checking for negative values in {display_brand}..."):
         try:
             # Query negative value details
             negative_details_df = session.table("DQ_NEGATIVE_VALUE_DETAILS").to_pandas()
             
-            if negative_details_df.empty:
-                st.success("✅ No negative value violations found!")
-                st.balloons()
+            # Apply brand filtering
+            filtered_negative_df = filter_df_by_brand(negative_details_df, data_brand)
+            
+            if filtered_negative_df.empty:
+                st.success(f"✅ **PASS** - No negative value violations found for {display_brand}")
             else:
-                # Apply brand filtering if needed
-                if display_brand != "All Brands":
-                    # Extract brand from RECORD_ID format: YYYY-MM-DD-BRAND-PLATFORM
-                    def extract_brand_from_record_id(record_id):
-                        try:
-                            parts = str(record_id).split('-')
-                            if len(parts) >= 5:
-                                # Format: YYYY-MM-DD-BRAND-PLATFORM
-                                return parts[3]
-                            elif len(parts) >= 3:
-                                # Fallback: assume simple format DATE-BRAND-PLATFORM
-                                return parts[1]
-                            return None
-                        except:
-                            return None
-                    
-                    negative_details_df['EXTRACTED_BRAND'] = negative_details_df['RECORD_ID'].apply(extract_brand_from_record_id)
-                    
-                    # Handle brand name variations and filtering
-                    def normalize_brand_name(brand_name):
-                        """Normalize brand names for comparison"""
-                        if not brand_name:
-                            return ""
-                        brand_name = str(brand_name).upper().strip()
-                        # Handle common variations
-                        if "BARRON" in brand_name:
-                            return "BARRONS"
-                        elif "MARKETWATCH" in brand_name or "MARKET WATCH" in brand_name:
-                            return "MARKETWATCH"
-                        elif "WSJ" in brand_name or "WALL STREET" in brand_name:
-                            return "WSJ"
-                        return brand_name
-                    
-                    # Normalize both the display brand and extracted brands
-                    normalized_display_brand = normalize_brand_name(display_brand)
-                    negative_details_df['NORMALIZED_BRAND'] = negative_details_df['EXTRACTED_BRAND'].apply(normalize_brand_name)
-                    
-                    # Filter based on normalized brand names
-                    if display_brand == "__GLOBAL__":
-                        # For Global/Uncategorized, show records where brand extraction failed or is unknown
-                        filtered_negative_df = negative_details_df[
-                            (negative_details_df['EXTRACTED_BRAND'].isna()) | 
-                            (negative_details_df['EXTRACTED_BRAND'] == '') |
-                            (negative_details_df['NORMALIZED_BRAND'] == '')
-                        ]
-                    else:
-                        filtered_negative_df = negative_details_df[
-                            negative_details_df['NORMALIZED_BRAND'] == normalized_display_brand
-                        ]
-                else:
-                    filtered_negative_df = negative_details_df
+                st.error(f"❌ **FAIL** - Found {len(filtered_negative_df)} negative value violations for {display_brand}")
                 
-                if filtered_negative_df.empty:
-                    st.success(f"✅ No negative value violations found for {display_brand}!")
-                else:
-                    st.error(f"❌ Found {len(filtered_negative_df)} negative value violations for {display_brand}")
-                    
-                    # Summary metrics
-                    col1, col2, col3, col4 = st.columns(4)
-                    with col1:
-                        st.metric("Total Violations", len(filtered_negative_df))
-                    with col2:
-                        unique_fields = filtered_negative_df['FIELD_NAME'].nunique()
-                        st.metric("Affected Fields", unique_fields)
-                    with col3:
-                        unique_records = filtered_negative_df['RECORD_ID'].nunique()
-                        st.metric("Affected Records", unique_records)
-                    with col4:
-                        latest_detection = filtered_negative_df['DETECTION_TIMESTAMP'].max()
-                        st.metric("Latest Detection", latest_detection.strftime('%Y-%m-%d %H:%M') if pd.notna(latest_detection) else "N/A")
-                    
-                    # Violations by field type
-                    st.subheader("📊 Violations by Field Type")
-                    field_summary = filtered_negative_df.groupby('FIELD_NAME').agg({
-                        'NEGATIVE_VALUE': ['count', 'min', 'max', 'mean'],
-                        'RECORD_ID': 'nunique'
-                    }).round(2)
-                    field_summary.columns = ['Count', 'Min Value', 'Max Value', 'Avg Value', 'Unique Records']
-                    st.dataframe(field_summary, use_container_width=True)
-                    
-                    # Visualization: Violations over time
-                    if 'DETECTION_TIMESTAMP' in filtered_negative_df.columns:
-                        st.subheader("📈 Violations Detection Timeline")
-                        try:
-                            # Convert timestamp and create daily summary
-                            filtered_negative_df['DETECTION_DATE'] = pd.to_datetime(filtered_negative_df['DETECTION_TIMESTAMP']).dt.date
-                            daily_violations = filtered_negative_df.groupby(['DETECTION_DATE', 'FIELD_NAME']).size().reset_index(name='Violation_Count')
-                            
-                            # Create timeline chart
-                            timeline_chart = alt.Chart(daily_violations).mark_bar().encode(
-                                x=alt.X('DETECTION_DATE:T', title='Detection Date'),
-                                y=alt.Y('Violation_Count:Q', title='Number of Violations'),
-                                color=alt.Color('FIELD_NAME:N', title='Field Name'),
-                                tooltip=['DETECTION_DATE:T', 'FIELD_NAME:N', 'Violation_Count:Q']
-                            ).properties(
-                                width=700,
-                                height=400,
-                                title=f"Daily Negative Value Violations - {display_brand}"
-                            )
-                            st.altair_chart(timeline_chart, use_container_width=True)
-                        except Exception as chart_error:
-                            st.warning(f"Could not create timeline chart: {chart_error}")
-                    
-                    # Distribution of negative values
-                    st.subheader("📉 Distribution of Negative Values")
-                    for field in filtered_negative_df['FIELD_NAME'].unique():
-                        field_data = filtered_negative_df[filtered_negative_df['FIELD_NAME'] == field]
-                        
-                        with st.expander(f"📋 {field} Details ({len(field_data)} violations)"):
-                            col1, col2 = st.columns([1, 2])
-                            
-                            with col1:
-                                st.write("**Statistics:**")
-                                st.write(f"• Count: {len(field_data)}")
-                                st.write(f"• Min: {field_data['NEGATIVE_VALUE'].min()}")
-                                st.write(f"• Max: {field_data['NEGATIVE_VALUE'].max()}")
-                                st.write(f"• Average: {field_data['NEGATIVE_VALUE'].mean():.2f}")
-                            
-                            with col2:
-                                # Histogram of negative values
-                                try:
-                                    hist_chart = alt.Chart(field_data).mark_bar().encode(
-                                        x=alt.X('NEGATIVE_VALUE:Q', bin=True, title='Negative Value'),
-                                        y=alt.Y('count()', title='Frequency'),
-                                        tooltip=['count()', 'NEGATIVE_VALUE:Q']
-                                    ).properties(
-                                        width=400,
-                                        height=200,
-                                        title=f"Distribution of {field} Negative Values"
-                                    )
-                                    st.altair_chart(hist_chart, use_container_width=True)
-                                except Exception as hist_error:
-                                    st.warning(f"Could not create histogram for {field}: {hist_error}")
-                    
-                    # Detailed records table
-                    st.subheader("📋 Detailed Violation Records")
-                    
-                    # Add filters
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        selected_fields = st.multiselect(
-                            "Filter by Field:", 
-                            options=filtered_negative_df['FIELD_NAME'].unique(),
-                            default=filtered_negative_df['FIELD_NAME'].unique(),
-                            key="negative_field_filter"
-                        )
-                    with col2:
-                        min_value = st.number_input(
-                            "Minimum Negative Value:", 
-                            value=float(filtered_negative_df['NEGATIVE_VALUE'].min()),
-                            key="min_negative_value"
-                        )
-                    
-                    # Apply filters
-                    display_df = filtered_negative_df[
-                        (filtered_negative_df['FIELD_NAME'].isin(selected_fields)) &
-                        (filtered_negative_df['NEGATIVE_VALUE'] >= min_value)
-                    ].sort_values('DETECTION_TIMESTAMP', ascending=False)
-                    
-                    # Display the filtered table
-                    st.dataframe(
-                        display_df[['RECORD_ID', 'FIELD_NAME', 'NEGATIVE_VALUE', 'RECORD_TIMESTAMP', 'DETECTION_TIMESTAMP']],
-                        use_container_width=True,
-                        column_config={
-                            'RECORD_ID': 'Record ID',
-                            'FIELD_NAME': 'Field',
-                            'NEGATIVE_VALUE': st.column_config.NumberColumn('Negative Value', format="%.2f"),
-                            'RECORD_TIMESTAMP': 'Record Date',
-                            'DETECTION_TIMESTAMP': 'Detected At'
-                        }
-                    )
-                    
-                    # Export functionality
-                    if st.button("📥 Download Violation Details", key="download_negative_values"):
-                        csv = display_df.to_csv(index=False)
-                        st.download_button(
-                            label="💾 Download CSV",
-                            data=csv,
-                            file_name=f"negative_value_violations_{display_brand}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                            mime="text/csv",
-                            key="download_negative_csv"
-                        )
+                # Show the violation records
+                st.subheader("Violation Details")
+                st.dataframe(
+                    filtered_negative_df[['RECORD_ID', 'FIELD_NAME', 'NEGATIVE_VALUE', 'DETECTION_TIMESTAMP']],
+                    use_container_width=True
+                )
                         
         except Exception as e:
-            st.error(f"An error occurred while loading negative value violations: {e}")
-    
-    # Generate AI insights for negative values
-    if 'filtered_negative_df' in locals() and not filtered_negative_df.empty:
-        generate_ai_insights_for_tab(
-            data_df=filtered_negative_df, 
-            analysis_type="Negative Value Analysis", 
-            brand_name=display_brand, 
-            relevant_cols=['FIELD_NAME', 'NEGATIVE_VALUE', 'RECORD_ID', 'DETECTION_TIMESTAMP']
-        )
+            st.error(f"❌ **ERROR** - Could not check for negative values: {e}")
 
 # --- Global AI Help Section at the Bottom ---
 st.divider()
