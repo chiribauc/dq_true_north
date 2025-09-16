@@ -9,7 +9,7 @@ import altair as alt
 
 # --- 1. Page Configuration ---
 st.set_page_config(
-    page_title="True North DQ Reports",
+    page_title="SENTINELO",
     page_icon="🤖",
     layout="wide",
 )
@@ -1277,4 +1277,5 @@ if st.button("Explain Rule", key="main_explain_button"):
         with st.spinner("AI is thinking..."):
             st.info(call_cortex_llm(get_help_prompt(help_question)))
     else:
+
         st.warning("Please enter a question about a rule.")
