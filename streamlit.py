@@ -609,7 +609,7 @@ with st.sidebar:
             st.session_state['selected_metric'] = "Orders"
 
 # --- 4. Main Page Layout ---
-st.title("🤖 True North DQ Reports")
+st.title("🤖 Sentinelooooo")
 if 'display_brand' not in st.session_state:
     st.info("Please select a view from the sidebar to begin.")
     st.stop()
@@ -1279,3 +1279,4 @@ if st.button("Explain Rule", key="main_explain_button"):
     else:
 
         st.warning("Please enter a question about a rule.")
+
